@@ -1,0 +1,943 @@
+---
+title: 'Data Science Final Project'
+subtitle: 'Using News Headlines Sentiment Analysis to Predict Stock Prices'
+authors: Mengsha Fu, Jiaqi Li, Mengsu Wang, Sihan Zheng 
+output:
+  html_document:
+    theme: journal
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+
+#Introduction 
+
+Our project aims at investigating how major news sentiment (e.g. new financial regulations, giant companies acquisition or bankruptcy) reported by mass media can influence the volatility of stock market price in U.S., and predict stock market price change affected by important events. This model may be applied by investors, governments, banks and other sectors to evaluate the financial impacts resulting from major events in the news reports.
+
+Data source: 
+-	2014 - 2017 Daily News Headlines of Wall Street Journal (News on 01/01/2017: http://www.wsj.com/public/page/archive-2017-1-1.html)
+-	Daily Dow Jones Stock Price ()
+-	Quarterly U.S. GDP (World Bank)
+-	Monthly U.S. Interest Rate (https://fred.stlouisfed.org/tags/series?t=interest+rate%3Bmonthly%3Busa)
+-	Daily NASDQ (https://www.nasdaq.com/aspx/DailyMarketStatistics.aspx)
+-	Monthly U.S. Unemployment Rate (https://data.bls.gov/timeseries/LNS14000000)
+-	Quarterly Company's Total Assets (https://ycharts.com/dashboard/)
+
+Methods: 
+We quantify the news headlines through calculating the daily average sentiment of key words and then merge the news sentiment with stock prices and macroeconomic indexes on the daily base. We mainly use SVM and decision tree to conduct the classification for the direction of stock price change. To evaluate how the news sentiment can influence the percentage change of stock price, we applied the linear regression for the Dow Jones price of 30 companies. Afterwards, LDA is utilized to categorize all the key words into different topics for us to detect the patterns of the news sentiment. 
+
+Conclusion:
+We compared the SVM the Decision Tree model and we found the accuracy of the Decision Tree model is around 75% percent. News sentiment is the most important among all input features. In addition, at the firm level, PG, PFE, NKE are mostly influenced by average news sentiment.
+
+Future work:
+The topic modeling can be explored more by connecting different topic groups with the change stock price. The percentage change of the stock price has not yet predicted within our analysis. We can evaluate the impacts from news sentiment on the percentage change of the stock price through other machine learning methods in the future.
+
+# News Headline Sentiment Analysis 
+
+Below is the sentiment analysis for the news headlines. We first collect the key words from the news headlines on the Wall Street Journal by day and clean the data through removing the stop words and blank tokens. According to the sentiment dictionary, all the key words are identified as "positive" or "negative". After assigning the "positive " as 1 and "negative" as 0, we can calculate the daily average sentiment of news. From 2014 to 2017, the overall average sentiment of all the news is around 0.46. 
+
+```{r, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#####################################
+# News Headline Sentiment Analysis  #
+#####################################
+
+library(rio)
+github.url <- "https://github.com/VivianSihanZHENG/Final-Project/blob/master/"
+file.url <- "rawnews.RData?raw=true" 
+news <- import(paste0(github.url, file.url)) 
+
+library(tidytext) #for easy text manipulation
+library(SnowballC) #for stemming words
+library(NLP)  
+library(tm) 
+library(dplyr) 
+
+# Get a sentiment dictionary 
+dict <- get_sentiments("bing") 
+
+# Parse your text
+# Create date formate 
+toks <- news %>% 
+  unnest_tokens(word, abstract)  %>% 
+  mutate(word = wordStem(word)) 
+
+toks$date <- as.Date(toks$date,"%Y-%m-%d") 
+
+#Remove stopwords and blank tokens
+data(stop_words)  
+toks <- toks %>% 
+  anti_join(stop_words) 
+
+#Get Average Sentiment
+toks <- toks %>% inner_join(dict) 
+
+senti_character <- as.character(toks$sentiment)
+senti_character <- gsub("negative","0", senti_character)  
+senti_character <- gsub("positive","1", senti_character)  
+toks$senti <- as.numeric(senti_character) 
+
+senti_bydate <- aggregate(toks$senti, by = list(date = toks$date), FUN = mean) 
+colnames(senti_bydate)[which(names(senti_bydate) == "x")] <- "avg.senti"
+```
+
+# Load Stock Data
+
+The Dow Jones industrial average (DJIA) includes 30 of America's largest companies from a wide range of industries. Thus, we loaded these 30 companies' daily stock price information, including opening and closing price. The direction and percentage of change are also included in the data frame to evaluate the vitality of stock price. 
+
+```{r, message = FALSE, warning = FALSE}
+###################
+##Load stock data##
+###################
+
+#Set Working Directory to Locate the 30 Companies' Data
+##Need data path change 
+setwd("/Users/shirleyfu/Desktop/Dow Jones") 
+
+#Get the File List
+##Need data path change
+files <- list.files(path = "/Users/shirleyfu/Desktop/Dow Jones", recursive = TRUE,
+                    pattern = "\\.csv$", full.names = FALSE)
+
+# Loop the data frame consisting all 30 companies' data
+data2=lapply(files, read.csv, header=TRUE, sep=",")
+data_rbind <- do.call("rbind", data2) 
+
+#Change the data type of Date as Date
+data_rbind$date <- as.Date(data_rbind$date, format = "%Y-%m-%d")
+
+#Get a new column of Year & Month so that we can subset the data for Year 2017
+data_rbind$Year <- as.numeric(format(data_rbind$date, "%Y"))
+data_rbind$Month <- as.numeric(format(data_rbind$date, "%m"))
+
+#Generate a new data frame of year 2015-2017
+data_4yrs <- subset(data_rbind, data_rbind$Year == 2017 | data_rbind$Year == 2016 | data_rbind$Year == 2015 | data_rbind$Year == 2014) 
+
+
+#Create a new column of the status of price change, using open price
+data_4yrs$ChangeOpening <- NA
+data_4yrs$ChangeClose <- NA
+data_4yrs$pctopen <- NA
+data_4yrs$pctclose <- NA
+
+
+firm_total <- data.frame(date = as.Date(NA),
+                         open = NA,
+                         close = NA,
+                         name = NA,
+                         ChangeOpening = NA,
+                         ChangeClose = NA,
+                         pctopen = NA,
+                         pctclose = NA)  
+
+
+#calculate opening price change 
+firmlist <- unique(data_4yrs$Name) 
+
+for (i in firmlist){ 
+  firm <- data_4yrs[data_4yrs$Name == i, c("date","open","close","ChangeOpening","ChangeClose","pctopen","pctclose")] 
+  
+  #open price change 
+  for (j in 2:nrow(firm)){ 
+    if (firm$open[j] > firm$open[j-1]){
+      firm$ChangeOpening[j-1] <- "increase" 
+    } else if (firm$open[j] <= firm$open[j-1]){
+      firm$ChangeOpening[j-1] <- "decrease"
+    }
+  }
+  
+  #close price change 
+  for (j in 2:nrow(firm)){ 
+    if (firm$close[j] > firm$close[(j-1)]){
+      firm$ChangeClose[j] <- "increase"
+    } else if (firm$close[j] <= firm$close[j-1]){
+      firm$ChangeClose[j] <- "decrease"
+    }
+  } 
+  
+  #percentage change 
+  for (j in 2:nrow(firm)){ 
+    firm$pctopen[j-1] <- (firm$open[j] - firm$open[j-1])/firm$open[j-1] *100
+    firm$pctclose[j] <- (firm$close[j] - firm$close[j-1])/firm$close[j-1] *100
+  }
+  
+  firm$name <- i 
+  firm_total <- rbind(firm_total, firm) 
+} 
+
+firm_total <- firm_total[-1,]
+```
+
+# Data Visualization I
+
+## Stock Pirce
+
+Below is the data visualization of the stock price change of 30 companies from 2014 to 2017. 
+
+```{r, message = FALSE, warning = FALSE}
+
+#######################
+##Line Graph 30 Firms##
+#######################
+
+#2014-17 Stock Open Price
+library(ggplot2)
+
+ggplot(data = firm_total)+ 
+  geom_line(mapping = aes(x=date,y=open),
+                                     color="gold4")+
+  facet_wrap(~name,ncol=6)+ 
+  theme(strip.background = element_blank(),
+        strip.text.x = element_text(size = 10),
+        axis.title.x=element_blank()) + 
+  #scale_x_continuous(breaks = c(2015, 2018))+ 
+  labs(y = "Firm Open Price", caption = "Kaggle") +
+  ggtitle("30 Firms Open Price from 2014-2017") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#2014-17 Stock Close Price
+
+ggplot(data = firm_total)+ 
+  geom_line(mapping = aes(x=date,y=close),
+            color="gold4")+
+  facet_wrap(~name,ncol=6)+ 
+  theme(strip.background = element_blank(),
+        strip.text.x = element_text(size = 10),
+        axis.title.x=element_blank()) + 
+  labs(y = "Firm Close Price", caption = "Kaggle") +
+  ggtitle("30 Firms Close Price from 2014-2017") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+```
+
+According to the above graphs, we can find that Boeing (BA), UnitedHealth (UNH), 3M (MMM) and McDonald's (MCD) have experienced rapid growth during this period. Goldman Sachs(GS), Chevron (CVX) and IBM (IBM) have seen more fluctuations than other companies. 
+
+
+# Merge News Sentiment With Stock Price By Date
+
+Below is the process to combine the news sentiment and stock price by date. We also added GDP, interest rate, NASDQ, unemployment rate and company total assets into the data frame as the control variables. 
+
+```{r, message = FALSE, warning = FALSE}
+#################################################
+# Merge news sentiment with stock price by date #
+#################################################
+
+sentiment_stock <- merge(senti_bydate, firm_total, by = "date", all = TRUE) 
+sentiment_stock <- na.omit(sentiment_stock)
+sentiment_stock$month <- as.numeric(format(sentiment_stock$date, "%m"))
+
+sentiment_stock$ChangeOpening <- as.factor(sentiment_stock$ChangeOpening)
+sentiment_stock$ChangeClose <- as.factor(sentiment_stock$ChangeClose)
+
+sentiment_stock$quarter <- ceiling(as.numeric(sentiment_stock$month) / 3) 
+sentiment_stock$year <- as.numeric(format(sentiment_stock$date, "%Y"))
+
+
+#merge with GDP
+
+#Load gdp 
+library(rio)
+github.url <- "https://github.com/VivianSihanZHENG/Final-Project/blob/master/"
+file.url <- "gdp.xlsx?raw=true"
+
+gdp <- import(paste0(github.url, file.url))
+gdp$quarter <- gsub("Q","", gdp$quarter)
+gdp <- gdp[,-3] 
+gdp$quarter <- as.numeric(gdp$quarter) 
+sentiment_stock <- merge(sentiment_stock, gdp, by = c("year","quarter")) 
+
+
+#Interest rate
+file.url <- "interest.xlsx?raw=true"
+interest <- import(paste0(github.url, file.url))
+
+colnames(interest)[which(names(interest) == "rate")] <- "interest.rate"
+interest$interest.rate <- as.numeric(interest$interest.rate)
+interest$year <- as.numeric(format(interest$date,"%Y"))
+interest$month <- as.numeric(format(interest$date,"%m"))
+interest <- interest[,-1]
+sentiment_stock <- merge(sentiment_stock, interest, by = c("year","month")) 
+
+
+#NASDQ
+file.url <- "NASDQ.xlsx?raw=true"
+NASDQ <- import(paste0(github.url, file.url))
+
+colnames(NASDQ)[which(names(NASDQ) == "Date")] <- "date"
+colnames(NASDQ)[which(names(NASDQ) == "Open")] <- "open_nasdq"
+colnames(NASDQ)[which(names(NASDQ) == "Close")] <- "close_nasdq"
+NASDQ <- NASDQ[,c("date", "open_nasdq","close_nasdq")]
+NASDQ$date <- as.Date(NASDQ$date)
+sentiment_stock <- merge(sentiment_stock, NASDQ, by = "date") 
+
+
+#unemp
+file.url <- "unemployment.xlsx?raw=true"
+unemp <- import(paste0(github.url, file.url))
+
+sentiment_stock$month <- as.numeric(sentiment_stock$month) 
+sentiment_stock <- merge(sentiment_stock, unemp, by = c("year","month"))
+
+
+#assets
+file.url <- "asset.xlsx?raw=true"
+asset<- import(paste0(github.url, file.url)) 
+asset$name <- toupper(asset$name)
+sentiment_stock <- merge(sentiment_stock, asset, by = c("year","quarter","name"))
+
+```
+
+# SVM Models
+
+Below is the SVM models that predict the change of the stock price by the news sentiments. With the control of GDP, interest rate, unemployment rate, NASDAQ and company total assets, we use the positive and negative news sentiments to predict whether the price on that day would increase or not. 
+
+```{r, message = FALSE, warning = FALSE}
+
+###################
+##SUPPORT VECTORS##
+###################  
+#Load svm libraries
+library(e1071) 
+
+train <- sentiment_stock[(sentiment_stock$avg.senti > 0.65 | sentiment_stock$avg.senti < 0.35), ] # only keep sentiment > 0.65 or < 0.35
+train.positive <- sentiment_stock[sentiment_stock$avg.senti > 0.5, ]  # only keep positive sentiment 
+train.negative <- sentiment_stock[sentiment_stock$avg.senti < 0.5, ]  # only keep negative sentiment 
+
+subfile <- c("train","train.positive","train.negative")
+
+#train <- sentiment_stock[sentiment_stock$year == 2015 | sentiment_stock$year == 2016, ]
+#test <- sentiment_stock[sentiment_stock$year == 2017,] 
+
+
+# Function that creates k folds 
+  kfolds <- function(k){ 
+    #
+    #Desc: Assign each record to one of the k-folds 
+    # 
+    #Args:
+    #  k = number of folds   
+    # 
+    #Returns:
+    #  a vector of the partition assignments 
+    #
+    train$vec <- runif(nrow(train)) # ramdonly assign each observation with a random number 
+    train$kfold <-  cut(train$vec, breaks = k, label = FALSE) # randomly assign observations into k groups according to the random numbers
+    return(train) 
+  } 
+  train <- cbind(train, kfolds(5)) 
+  colnames(train)[grep("kfolds", names(train))] <- "kfold" 
+  
+  kfolds <- function(k){ 
+    #
+    #Desc: Assign each record to one of the k-folds 
+    # 
+    #Args:
+    #  k = number of folds   
+    # 
+    #Returns:
+    #  a vector of the partition assignments 
+    #
+    train.positive$vec <- runif(nrow(train.positive)) # ramdonly assign each observation with a random number 
+    train.positive$kfold <-  cut(train.positive$vec, breaks = k, label = FALSE) # randomly assign observations into k groups according to the random numbers
+    return(train.positive) 
+  } 
+  train.positive <- cbind(train.positive, kfolds(5)) 
+  colnames(train.positive)[grep("kfolds", names(train.positive))] <- "kfold" 
+  
+
+  kfolds <- function(k){ 
+    #
+    #Desc: Assign each record to one of the k-folds 
+    # 
+    #Args:
+    #  k = number of folds   
+    # 
+    #Returns:
+    #  a vector of the partition assignments 
+    #
+    train.negative$vec <- runif(nrow(train.negative)) # ramdonly assign each observation with a random number 
+    train.negative$kfold <-  cut(train.negative$vec, breaks = k, label = FALSE) # randomly assign observations into k groups according to the random numbers
+    return(train.negative) 
+  } 
+  train.negative <- cbind(train.negative, kfolds(5)) 
+  colnames(train.negative)[grep("kfolds", names(train.negative))] <- "kfold" 
+  
+
+#Load F1 Score
+meanf1 <- function(actual, predicted){
+  
+  #Mean F1 score function
+  #actual = a vector of actual labels
+  #predicted = predicted labels
+  
+  classes <- unique(actual)
+  results <- data.frame()
+  for(k in classes){
+    results <- rbind(results, 
+                     data.frame(class.name = k,
+                                weight = sum(actual == k)/length(actual),
+                                precision = sum(predicted == k & actual == k)/sum(predicted == k), 
+                                recall = sum(predicted == k & actual == k)/sum(actual == k)))
+  }
+  results$score <- results$weight * 2 * (results$precision * results$recall) / (results$precision + results$recall) 
+  return(sum(results$score)) 
+}
+
+
+scores <- data.frame()  
+for (i in unique(train$kfold)){
+  #Fit SVM  under default assumptions -- cost = 1, gamma = 0.055
+  #svm.rbf.fit <- svm(ChangeOpening ~ avg.senti + name + growth + interest.rate + unemployment + open_nasdq, 
+  #                   data = train[train$folds != i, ], kernel = "radial", 
+  #                   cost = 1, gamma = 0.05555) 
+  
+  #Tools to review output
+  #print(svm.rbf.fit) 
+  
+  #Calibrate SVMs
+  pred.test <- svm(ChangeOpening ~ avg.senti + growth + interest.rate + unemployment + open_nasdq + assets, 
+                   data = train[train$kfold != i, ], kernel = "radial", cost = 1, gamma = 8) 
+  print(pred.test)  
+  
+  #Predict
+  pred.rbf <- predict(pred.test, train[train$kfold == i, ]) 
+  scores <- rbind(scores, data.frame(model = "SVM", 
+                                     actual = train[train$kfold == i, ]$ChangeOpening, 
+                                     predicted = pred.rbf)) 
+  #examine result
+  table(pred.rbf) 
+}
+
+meanf1(scores$actual, scores$predicted) 
+
+
+
+#negative sentiment 
+scores.negative <- data.frame()  
+for (i in unique(train.negative$kfold)){
+  #Fit SVM  under default assumptions -- cost = 1, gamma = 0.055
+  #svm.rbf.fit <- svm(ChangeOpening ~ avg.senti + name + growth + interest.rate + unemployment + open_nasdq, 
+  #                   data = train[train$folds != i, ], kernel = "radial", 
+  #                   cost = 1, gamma = 0.05555) 
+  
+  #Tools to review output
+  #print(svm.rbf.fit) 
+  
+  #Calibrate SVMs
+  pred.test <- svm(ChangeOpening ~ avg.senti + growth + interest.rate + unemployment + open_nasdq + assets, 
+                   data = train.negative[train.negative$kfold != i, ], kernel = "radial", cost = 1, gamma = 8) 
+  print(pred.test)  
+  
+  #Predict
+  pred.rbf <- predict(pred.test, train.negative[train.negative$kfold == i, ]) 
+  scores.negative <- rbind(scores.negative, data.frame(model = "SVM", 
+                                            actual = train.negative[train.negative$kfold == i, ]$ChangeOpening, 
+                                            predicted = pred.rbf)) 
+  #examine result
+  table(pred.rbf) 
+}
+
+meanf1(scores.negative$actual, scores.negative$predicted) 
+
+
+
+#positive sentiment 
+scores.positive <- data.frame()  
+for (i in unique(train.positive$kfold)){
+  #Fit SVM  under default assumptions -- cost = 1, gamma = 0.055
+  #svm.rbf.fit <- svm(ChangeOpening ~ avg.senti + name + growth + interest.rate + unemployment + open_nasdq, 
+  #                   data = train[train$folds != i, ], kernel = "radial", 
+  #                   cost = 1, gamma = 0.05555) 
+  
+  #Tools to review output
+  #print(svm.rbf.fit) 
+  
+  #Calibrate SVMs
+  pred.test <- svm(ChangeOpening ~ avg.senti + growth + interest.rate + unemployment + open_nasdq + assets, 
+                   data = train.positive[train.positive$kfold != i, ], kernel = "radial", cost = 1, gamma = 8) 
+  print(pred.test)  
+  
+  #Predict
+  pred.rbf <- predict(pred.test, train.positive[train.positive$kfold == i, ]) 
+  scores.positive <- rbind(scores.positive, data.frame(model = "SVM", 
+                                                       actual = train.positive[train.positive$kfold == i, ]$ChangeOpening, 
+                                                       predicted = pred.rbf)) 
+  #examine result
+  table(pred.rbf) 
+}
+
+meanf1(scores.negative$actual, scores.negative$predicted) 
+
+
+#Close price 
+scores.close <- data.frame() 
+for (i in unique(train$kfold)){
+  #Fit SVM  under default assumptions -- cost = 1, gamma = 0.055
+  #svm.rbf.fit <- svm(ChangeOpening ~ avg.senti + name + growth + interest.rate + unemployment + open_nasdq, 
+  #                   data = train[train$folds != i, ], kernel = "radial", 
+  #                   cost = 1, gamma = 0.05555) 
+  
+  #Tools to review output
+  #print(svm.rbf.fit) 
+  
+  #Calibrate SVMs
+  pred.test.close <- svm(ChangeClose ~ avg.senti + growth + interest.rate + unemployment + close_nasdq + assets, 
+                         data = train[train$kfold != i, ], kernel = "radial", cost = 1, gamma = 8) 
+  print(pred.test.close)  
+  
+  #Predict
+  pred.rbf.close <- predict(pred.test.close, train[train$kfold == i, ]) 
+  scores.close <- rbind(scores.close, data.frame(model = "SVM", 
+                                                 actual = train[train$kfold == i, ]$ChangeClose, 
+                                                 predicted = pred.rbf.close)) 
+  #examine result
+  table(pred.rbf.close) 
+}
+
+meanf1(scores.close$actual, scores.close$predicted)
+```
+
+The Mean F1 Score for the sentiments predication on the open price change is around 70%.
+ 
+
+# Decision Tree 
+
+## Decision Tree for All the 30 Companies Together 
+
+Decision tree model is applied to predict the change of opening price of all companies. The input features of decision tree model include news sentiments, GDP, interest rate, unemployment rate, NASDAQ and company total assets.
+
+```{r, message = FALSE, warning = FALSE}
+
+#####################################################
+###Decision Tree for All the 30 Companies Together###
+#####################################################
+
+library(rpart) 
+scores2 <- data.frame() 
+for (i in unique(train$kfold)){
+  
+  # Refit with optimal
+  # cp = 0
+  fit.0 <- rpart(ChangeOpening ~ avg.senti + name + growth + 
+                   interest.rate + unemployment + open_nasdq + assets, 
+                 method = "class", data = train[train$kfold != i, ], cp = 0)
+  # printcp(fit.0)
+  # Put all cp into a data frame
+  fit.0.df <- as.data.frame(printcp(fit.0))
+  # Find the optimal cp
+  a <- min(fit.0.df$xerror)
+  b <- subset(fit.0.df, xerror == a)[, 5]
+  c <- a + b
+  d <- max(fit.0.df$xerror[fit.0.df$xerror <= c])
+  cp.opt <- max(subset(fit.0.df, xerror == d)[, 1])
+  
+  # Run the optimal decision tree
+  fit.opt <- rpart(ChangeOpening ~ avg.senti + growth + 
+                     interest.rate + unemployment + open_nasdq + assets, 
+                   method = "class", data = train[train$kfold != i, ], cp = cp.opt)
+  
+  # Predict values for test set
+  pred.opt.test <- predict(fit.opt, train[train$kfold == i, ], type='class')
+  scores2 <- rbind(scores2, data.frame(model = "Decision Tree", 
+                                       actual = train[train$kfold == i, ]$ChangeOpening, 
+                                       predicted = pred.opt.test))
+  #examine result
+  #table(pred.rbf)
+}
+
+meanf1(scores2$actual, scores2$predicted)
+
+#Determine which variable had the greatest influence
+fit.opt$variable.importance
+
+```
+
+The Mean F1 Score is around 75%.
+Table of Importance (variable.importance)
+   avg.senti    open_nasdq  unemployment        growth interest.rate        assets 
+   292.096701    236.909383    113.136274     96.780953     29.321198      4.540843
+   
+Among all the inputs, news sentiment has the highest score, which means the news sentiment has significant impacts on the change of stock price.
+
+##Decision Tree for Individual Company
+
+Decision tree model is applied to predict the change of open price of 29 companies* respectively. (The input features of decision tree model are as previous. The importance of each input features (avg.senti, company name, GDP growth, interest.rate, unemployment, open_nasdq, and companies' total assets) is also calculated.) ) We seperately calculated each firm's meanf1 and variable.importance. The news sentiment has the largest influence on P&G, WMT (Walmart), and BA (Boeing). These three companies' avg.senti score is the highest among all input features. Some firms are more sensitive to news sentiment than other firms. Our model can be used in the the investment portfolio for those firms that are easily influenced by news if the accuracy of it could be improve to a higher level in the future.
+
+*DowDuPont (DWDP)'s open price information is not complete in the data frame. 
+
+```{r, message = FALSE, warning = FALSE}
+
+##########################################
+###Decision Tree for Individual Company###
+##########################################
+
+library(rpart)
+##variable importance at company level
+tree.importance <- function(){
+  
+  results <- c()
+  importance <- data.frame()
+  
+  scores2 <- data.frame() 
+  for (i in unique(train$kfold)){
+    for (j in unique(train$name)){
+      
+      scores2 <- data.frame() 
+      train1 <- train[train$name != j, ]
+      
+      # Refit with optimal
+      # cp = 0
+      fit.0 <- rpart(ChangeOpening ~ avg.senti + name + growth + 
+                       interest.rate + unemployment + open_nasdq + assets, 
+                     method = "class", data = train1[train1$kfold != i, ], cp = 0)
+      # printcp(fit.0)
+      # Put all cp into a data frame
+      fit.0.df <- as.data.frame(printcp(fit.0))
+      # Find the optimal cp
+      a <- min(fit.0.df$xerror)
+      b <- subset(fit.0.df, xerror == a)[, 5]
+      c <- a + b
+      d <- max(fit.0.df$xerror[fit.0.df$xerror <= c])
+      cp.opt <- max(subset(fit.0.df, xerror == d)[, 1])
+      
+      # Run the optimal decision tree
+      fit.opt <- rpart(ChangeOpening ~ avg.senti + growth + interest.rate + 
+                         unemployment + open_nasdq + assets, 
+                       method = "class", data = train1[train1$kfold != i, ], cp = cp.opt)
+      
+      #importance <- rbind(importance, fit.opt$variable.importance)
+      import <- as.data.frame(print(fit.opt$variable.importance))
+      importance <- rbind(importance, import)
+    }
+    return(importance)
+  }
+}
+
+tree.firm29 <- tree.importance()
+x2 <- as.data.frame(rep(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                          20, 21, 22, 23, 24, 25, 26, 27, 28, 29), each = 6))
+tree.firm29 <- cbind(tree.firm29, x2)
+colnames(tree.firm29) <- c("importance", "number")
+
+##Print company name
+for (j in unique(train$name))
+  firm <- as.data.frame(as.character(unique(train$name)))
+colnames(firm) <- c("firm")
+x1 <- as.data.frame(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                      20, 21, 22, 23, 24, 25, 26, 27, 28, 29))
+colnames(x1) <- c("number")
+firm.name <- cbind(firm, x1)
+
+#Total companies' name and their decision tree variable importance
+company.importance <- merge(firm.name, tree.firm29, by = "number")
+
+
+##meanf1
+meanf1.company <- function(){
+  
+  results <- data.frame()
+  
+  scores2 <- data.frame() 
+  for (i in unique(train$kfold)){
+    for (j in unique(train$name)){
+      
+      scores2 <- data.frame() 
+      train1 <- train[train$name != j, ]
+      
+      # Refit with optimal
+      # cp = 0
+      fit.0 <- rpart(ChangeOpening ~ avg.senti + name + growth + 
+                       interest.rate + unemployment + open_nasdq + assets, 
+                     method = "class", data = train1[train1$kfold != i, ], cp = 0)
+      # printcp(fit.0)
+      # Put all cp into a data frame
+      fit.0.df <- as.data.frame(printcp(fit.0))
+      # Find the optimal cp
+      a <- min(fit.0.df$xerror)
+      b <- subset(fit.0.df, xerror == a)[, 5]
+      c <- a + b
+      d <- max(fit.0.df$xerror[fit.0.df$xerror <= c])
+      cp.opt <- max(subset(fit.0.df, xerror == d)[, 1])
+      
+      # Run the optimal decision tree
+      fit.opt <- rpart(ChangeOpening ~ avg.senti + growth + interest.rate + 
+                         unemployment + open_nasdq + assets, 
+                       method = "class", data = train1[train1$kfold != i, ], cp = cp.opt)
+      
+      # Predict values for test set
+      pred.opt.test <- predict(fit.opt, train1[train1$kfold == i, ], type='class')
+      scores2 <- rbind(scores2, data.frame(model = "Decision Tree", 
+                                           actual = train1[train1$kfold == i, ]$ChangeOpening, 
+                                           predicted = pred.opt.test))
+      
+      # Mean F1
+      mean.data <- meanf1(scores2$actual, scores2$predicted)
+      # Append
+      results <- rbind(results, mean.data)
+      colnames(results) <- "meanf1"
+    }
+    return(results)
+  }
+}
+
+meanf1.firm29 <- meanf1.company()
+#View(meanf1.firm29)
+
+#Set a data frame the same long as 29 firms
+x2 <- as.data.frame(c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                      20, 21, 22, 23, 24, 25, 26, 27, 28, 29))
+colnames(x2) <- c("number")
+meanf1.firm29 <- cbind(meanf1.firm29, x2)
+
+#Total companies' name, their decision tree variable importance, and their meanf1
+company.importance.total <- merge(company.importance, meanf1.firm29, by = "number")
+company.importance.total1 <- company.importance.total[, -3]
+company.importance.total2 <- cbind(company.importance.total1, tree.firm29)[, -5]
+#View(company.importance.total2)
+
+company.importance.total2$names <- rownames(company.importance.total2)
+
+#Chart of meanf1 and variable importance in each firm
+company.importance.total3 <- data.frame(names = row.names(company.importance.total2), company.importance.total2)[, -6]
+company.importance.total3
+
+```
+
+# Data Visualization II
+## Topic Modeling
+
+Following the topic modeling that categorize all the key words in the headlines into different topic groups. 
+
+```{r, message = FALSE, warning = FALSE}
+
+####################
+###TOPIC MODELING###
+####################
+
+#Count words
+news.count <- news %>%
+  unnest_tokens(word, abstract) %>%
+  count(date, word, sort = TRUE)  %>%
+  anti_join(stop_words)
+#Calculate TF-IDF
+news.count <- news.count %>%
+  bind_tf_idf(word, date, n)
+
+#News.count by year
+news.count1 <- subset(news.count, news.count$date <= "2014-12-31")
+news.count2 <- subset(news.count, news.count$date >= "2015-1-1" & news.count$date <= "2015-12-31")
+news.count3 <- subset(news.count, news.count$date >= "2016-1-1" & news.count$date <= "2016-12-31")
+news.count4 <- subset(news.count, news.count$date >= "2017-1-1" & news.count$date <= "2017-12-31")
+
+#######################
+#Topic Modeling in 2014
+week <- c("monday","tuesday","wednesday","thursday","friday","saturday","sunday")
+for (i in week){
+  news.count1 <- subset(news.count1, news.count1$word != i)
+}
+
+year <- c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct",
+          "nov", "dec", "january", "february", "march", "april", "may", "june",
+          "july", "august", "september", "october","november", "december")
+for (j in year){
+  news.count1 <- subset(news.count1, news.count1$word != j)
+}
+
+#Keep top 10 TFIDF by group
+news.count.top1 <- news.count1 %>%
+  group_by(date) %>%
+  top_n(n = 10, wt = tf_idf)
+#Create Document Term Matrix
+news.matrix1 <- news.count.top1 %>% cast_dtm(date, word, n)
+
+#LDA
+library(topicmodels)
+library(ggplot2)
+
+##LDA: Latent Dirichlet Allocaiton
+#Run LDA
+tal_lda1 <- LDA(news.matrix1, k = 6, control = list(seed = 1234))
+tal_top1 <- tidy(tal_lda1, matrix = "beta")
+
+#
+tal_top_terms1 <- tal_top1 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+tal_top_terms1 %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) + 
+  theme(text = element_text(size=10)) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+#######################
+#Topic Modeling in 2015
+week <- c("monday","tuesday","wednesday","thursday","friday","saturday","sunday")
+for (i in week){
+  news.count2 <- subset(news.count2, news.count2$word != i)
+}
+
+year <- c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct",
+          "nov", "dec", "january", "february", "march", "april", "may", "june",
+          "july", "august", "september", "october","november", "december")
+for (j in year){
+  news.count2 <- subset(news.count2, news.count2$word != j)
+}
+
+#Keep top 10 TFIDF by group
+news.count.top2 <- news.count2 %>%
+  group_by(date) %>%
+  top_n(n = 10, wt = tf_idf)
+#Create Document Term Matrix
+news.matrix2 <- news.count.top2 %>% cast_dtm(date, word, n)
+
+#LDA
+library(topicmodels)
+library(ggplot2)
+
+##LDA: Latent Dirichlet Allocaiton
+#Run LDA
+tal_lda2 <- LDA(news.matrix2, k = 6, control = list(seed = 1234))
+tal_top2 <- tidy(tal_lda2, matrix = "beta")
+
+#
+tal_top_terms2 <- tal_top2 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+tal_top_terms2 %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) + 
+  theme(text = element_text(size=10)) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+#######################
+#Topic Modeling in 2016
+week <- c("monday","tuesday","wednesday","thursday","friday","saturday","sunday")
+for (i in week){
+  news.count3 <- subset(news.count3, news.count3$word != i)
+}
+
+year <- c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct",
+          "nov", "dec", "january", "february", "march", "april", "may", "june",
+          "july", "august", "september", "october","november", "december")
+for (j in year){
+  news.count3 <- subset(news.count3, news.count3$word != j)
+}
+
+#Keep top 10 TFIDF by group
+news.count.top3 <- news.count3 %>%
+  group_by(date) %>%
+  top_n(n = 10, wt = tf_idf)
+#Create Document Term Matrix
+news.matrix3 <- news.count.top3 %>% cast_dtm(date, word, n)
+
+#LDA
+library(topicmodels)
+library(ggplot2)
+
+##LDA: Latent Dirichlet Allocaiton
+#Run LDA
+tal_lda3 <- LDA(news.matrix3, k = 6, control = list(seed = 1234))
+tal_top3 <- tidy(tal_lda3, matrix = "beta")
+
+#
+tal_top_terms3 <- tal_top3 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+tal_top_terms3 %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) + 
+  theme(text = element_text(size=10)) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+#######################
+#Topic Modeling in 2017
+week <- c("monday","tuesday","wednesday","thursday","friday","saturday","sunday")
+for (i in week){
+  news.count4 <- subset(news.count4, news.count4$word != i)
+}
+
+year <- c("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct",
+          "nov", "dec", "january", "february", "march", "april", "may", "june",
+          "july", "august", "september", "october","november", "december")
+for (j in year){
+  news.count4 <- subset(news.count4, news.count4$word != j)
+}
+
+#Keep top 10 TFIDF by group
+news.count.top4 <- news.count4 %>%
+  group_by(date) %>%
+  top_n(n = 10, wt = tf_idf)
+#Create Document Term Matrix
+news.matrix4 <- news.count.top4 %>% cast_dtm(date, word, n)
+
+#LDA
+library(topicmodels)
+library(ggplot2)
+
+##LDA: Latent Dirichlet Allocaiton
+#Run LDA
+tal_lda4 <- LDA(news.matrix4, k = 6, control = list(seed = 1234))
+tal_top4 <- tidy(tal_lda4, matrix = "beta")
+
+#
+tal_top_terms4 <- tal_top4 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+tal_top_terms4 %>%
+  mutate(term = reorder(term, beta)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) + 
+  theme(text = element_text(size=10)) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip()
+
+```
+
+## WordCloud
+
+The word cloud shows the key words that have the highest frequency from 2014 to 2017.
+
+```{r, message = FALSE, warning = FALSE}
+
+#############
+##Wordcloud##
+#############
+#Wordcloud all news key words from 2014-17
+library(RColorBrewer)
+library(wordcloud)
+
+# Calculate Frequency
+#uniwords <- unique(news.count$word)
+
+#WordCloud2014-2017
+news.word <- aggregate(news.count$n, by = list(date = news.count$word), FUN = length)
+colnames(news.word) <- c("word", "frequency")
+
+# Use worldcloud to scale each reason
+wordcloud(news.word$word, 100 * news.word$frequency,
+          min.freq = 1000, max.words = Inf,
+          colors = c("red", "yellow", "blue", "orange", "dark blue"),
+          random.color = T)
+
+```
